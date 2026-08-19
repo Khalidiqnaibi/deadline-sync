@@ -39,10 +39,12 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-SCOPES = [
+CLASSROOM_SCOPES = [
     "https://www.googleapis.com/auth/classroom.courses.readonly",
     "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
     "https://www.googleapis.com/auth/classroom.student-submissions.me.readonly",
+]
+CALENDAR_SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
 ]
 
@@ -52,8 +54,14 @@ MARKER_VALUE = "1"
 # NOTE: Calendar's privateExtendedProperty filter is exact-match only (no
 # wildcards), so we need MARKER_KEY to query "everything this tool created"
 # and TAG_KEY to tell those events apart.
+
+# Two Google accounts, two tokens: Classroom is read as your school account,
+# Calendar is written to your personal account. Same OAuth *client* (same
+# credentials.json) can authorize both — you just log in as a different
+# person each time the browser opens.
 CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
-TOKEN_FILE = os.getenv("GOOGLE_TOKEN_FILE", "token.json")
+CLASSROOM_TOKEN_FILE = os.getenv("CLASSROOM_TOKEN_FILE", "classroom_token.json")
+CALENDAR_TOKEN_FILE = os.getenv("CALENDAR_TOKEN_FILE", "calendar_token.json")
 CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
 LOCAL_TZ = ZoneInfo(os.getenv("TIMEZONE", "UTC"))
 REMINDER_MINUTES = int(os.getenv("REMINDER_MINUTES", "60"))
@@ -110,16 +118,22 @@ def _date_only_due(d: dt.date) -> dt.datetime:
 # --------------------------------------------------------------------------
 
 
-def google_credentials() -> Credentials:
+def google_credentials(token_file: str, scopes: list[str], label: str) -> Credentials:
+    """Get (or refresh, or newly obtain) credentials for one Google account.
+
+    `label` is just for the log line / prompt, e.g. "Classroom (school account)"
+    or "Calendar (personal account)" — helps you remember which login to use
+    when the browser window pops up.
+    """
     creds: Credentials | None = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, scopes)
 
     if creds and creds.valid:
         return creds
 
     if creds and creds.expired and creds.refresh_token:
-        log.debug("Refreshing expired Google token")
+        log.debug("Refreshing expired token: %s", token_file)
         creds.refresh(Request())
     else:
         if not os.path.exists(CREDENTIALS_FILE):
@@ -127,11 +141,15 @@ def google_credentials() -> Credentials:
                 f"Missing {CREDENTIALS_FILE}. Download an OAuth client "
                 "(Desktop app) from Google Cloud Console and save it there."
             )
-        log.info("No valid token — opening browser for one-time consent.")
-        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+        log.info(
+            "No valid token for %s — opening browser. "
+            "Log in with the correct account for this one.",
+            label,
+        )
+        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, scopes)
         creds = flow.run_local_server(port=0)
 
-    with open(TOKEN_FILE, "w") as fh:
+    with open(token_file, "w") as fh:
         fh.write(creds.to_json())
     return creds
 
@@ -470,16 +488,21 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    creds = google_credentials()
-
     deadlines: list[Deadline] = []
     if not args.skip_classroom:
-        deadlines += fetch_classroom_deadlines(creds)
+        classroom_creds = google_credentials(
+            CLASSROOM_TOKEN_FILE, CLASSROOM_SCOPES, "Classroom (school account)"
+        )
+        deadlines += fetch_classroom_deadlines(classroom_creds)
     if not args.skip_jira:
         deadlines += fetch_jira_deadlines()
 
     log.info("Collected %d deadline(s) total", len(deadlines))
-    sync(deadlines, creds, dry_run=args.dry_run)
+
+    calendar_creds = google_credentials(
+        CALENDAR_TOKEN_FILE, CALENDAR_SCOPES, "Calendar (personal account)"
+    )
+    sync(deadlines, calendar_creds, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

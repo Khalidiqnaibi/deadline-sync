@@ -45,7 +45,14 @@ Leave the Jira vars blank if you only want Classroom.
 python deadline_sync.py --dry-run --verbose
 ```
 
-A browser opens once for consent; after that `token.json` refreshes itself silently (which is what makes unattended cron runs work).
+**If your Classroom is on a school/university account and you want events on a different personal Google Calendar**, the script needs two separate logins — one OAuth *client* (`credentials.json`), used twice:
+
+- First browser popup: log in with your **school account** → grants Classroom read access → saved to `classroom_token.json`.
+- Second browser popup: log in with your **personal Gmail** → grants Calendar write access → saved to `calendar_token.json`.
+
+You'll see two separate "opening browser" log lines telling you which account to use for each. After that first run, both tokens refresh themselves silently — this is what makes unattended cron runs work without you touching a browser again.
+
+If Classroom and Calendar are the *same* Google account, just log in the same way both times — no extra setup needed.
 
 Read the `CREATE` lines. **Check the times against what Classroom/Jira actually show you** before you let it write anything. When they look right:
 
@@ -97,14 +104,3 @@ python test_logic.py
 ```
 
 Covers timezone conversion, date-only handling, the change-detection diff, and Jira field mapping — no network, no credentials needed.
-
----
-
-## Things to watch (verify these against your own data)
-
-These are the parts most likely to be subtly wrong for *your* setup:
-
-- **Classroom `dueTime` is UTC.** The script converts to your `TIMEZONE`. If an assignment shows on the wrong day by a few hours, `TIMEZONE` in `.env` is wrong. An 11:59 PM EDT deadline arrives from the API as 03:59 UTC *the next day* — easy to get backwards.
-- **Jira `duedate` has no time component.** Everything from Jira lands at `DATE_ONLY_DUE_TIME` (default 23:59). If your team treats due dates as start-of-day, change it to `09:00`.
-- **`DELETE_COMPLETED=true`** removes future events for items that fall out of your JQL or get submitted. If you edit an event by hand, the next run will overwrite or delete it. Set to `false` if that bothers you.
-- **The Jira search endpoint.** Jira Cloud moved from `/rest/api/3/search` to `/rest/api/3/search/jql`. The script tries the new one and falls back on 404/410. If your instance does something else, run with `--verbose` and check.
