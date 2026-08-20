@@ -39,9 +39,20 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
+# Google sometimes returns a *deduplicated* scope set that doesn't literally
+# match what we asked for (overlapping Classroom scopes collapse into each
+# other). oauthlib treats any mismatch as fatal, which kills the login even
+# though the granted scopes are sufficient. This relaxes that check.
+# The real safety net is the 403 handling below: if a scope we actually need
+# is genuinely missing, the API call fails loudly and tells you so.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 CLASSROOM_SCOPES = [
+    # NOTE: do NOT add classroom.coursework.me.readonly here. Google silently
+    # drops it from the granted set (it overlaps with the two below), and
+    # oauthlib then aborts the whole flow with "Scope has changed from ...".
+    # courses.readonly is already sufficient to call courses.courseWork.list().
     "https://www.googleapis.com/auth/classroom.courses.readonly",
-    "https://www.googleapis.com/auth/classroom.coursework.me.readonly",
     "https://www.googleapis.com/auth/classroom.student-submissions.me.readonly",
 ]
 CALENDAR_SCOPES = [
@@ -218,6 +229,17 @@ def fetch_classroom_deadlines(creds: Credentials) -> list[Deadline]:
                     .execute()
                 )
             except HttpError as e:
+                if e.resp.status == 403:
+                    sys.exit(
+                        f"\n403 from Classroom while listing coursework for "
+                        f"'{course_name}'.\n"
+                        "This usually means a required scope wasn't granted. Fix:\n"
+                        "  1. Cloud Console -> APIs & Services -> OAuth consent "
+                        "screen -> Data access\n"
+                        "  2. Make sure the Classroom scopes are listed there\n"
+                        f"  3. Delete {CLASSROOM_TOKEN_FILE} and re-run\n"
+                        f"\nRaw error: {e}"
+                    )
                 log.warning("Skipping course %s: %s", course_name, e)
                 break
 

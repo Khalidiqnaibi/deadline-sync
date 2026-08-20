@@ -181,3 +181,5 @@ cython_debug/
 .cursorindexingignore
 credentials.json
 uni_creds.json
+calendar_token.json
+classroom_token.json
