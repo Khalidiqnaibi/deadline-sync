@@ -37,7 +37,32 @@ from googleapiclient.errors import HttpError
 # Config
 # --------------------------------------------------------------------------
 
-load_dotenv()
+
+def app_dir() -> str:
+    """Folder that .env, credentials.json and the token files live in.
+
+    Frozen (PyInstaller .exe): the folder containing the .exe. NOT sys._MEIPASS,
+    which is a temp extraction dir that's wiped on exit — tokens written there
+    would vanish, forcing a browser login on every single run.
+
+    Not frozen: the folder containing this script.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_DIR = app_dir()
+
+
+def beside_app(path: str) -> str:
+    """Absolute paths pass through; relative ones resolve next to the app."""
+    return path if os.path.isabs(path) else os.path.join(APP_DIR, path)
+
+
+# Load .env from the app folder, not the current working directory — double
+# clicking an .exe or running it from Task Scheduler gives an unpredictable cwd.
+load_dotenv(os.path.join(APP_DIR, ".env"))
 
 # Google sometimes returns a *deduplicated* scope set that doesn't literally
 # match what we asked for (overlapping Classroom scopes collapse into each
@@ -70,9 +95,9 @@ MARKER_VALUE = "1"
 # Calendar is written to your personal account. Same OAuth *client* (same
 # credentials.json) can authorize both — you just log in as a different
 # person each time the browser opens.
-CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
-CLASSROOM_TOKEN_FILE = os.getenv("CLASSROOM_TOKEN_FILE", "classroom_token.json")
-CALENDAR_TOKEN_FILE = os.getenv("CALENDAR_TOKEN_FILE", "calendar_token.json")
+CREDENTIALS_FILE = beside_app(os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json"))
+CLASSROOM_TOKEN_FILE = beside_app(os.getenv("CLASSROOM_TOKEN_FILE", "classroom_token.json"))
+CALENDAR_TOKEN_FILE = beside_app(os.getenv("CALENDAR_TOKEN_FILE", "calendar_token.json"))
 CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
 LOCAL_TZ = ZoneInfo(os.getenv("TIMEZONE", "UTC"))
 REMINDER_MINUTES = int(os.getenv("REMINDER_MINUTES", "60"))
@@ -110,7 +135,12 @@ class Deadline:
     @property
     def summary(self) -> str:
         icon = "📚" if self.source == "classroom" else "🎫"
-        return f"{icon} {self.title}"
+        # Classroom "titles" are sometimes a whole paragraph with line breaks.
+        # A calendar summary needs to be one short line.
+        title = " ".join(self.title.split())
+        if len(title) > 80:
+            title = title[:77].rstrip() + "..."
+        return f"{icon} {title}"
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -410,6 +440,9 @@ def build_event_body(d: Deadline) -> dict:
     start = d.due
     end = d.due + dt.timedelta(minutes=EVENT_LENGTH_MINUTES)
     desc = d.description
+    full_title = " ".join(d.title.split())
+    if len(full_title) > 80:
+        desc = f"{full_title}\n\n{desc}".strip()
     if d.url:
         desc = f"{desc}\n\n{d.url}".strip()
     return {
@@ -428,14 +461,45 @@ def build_event_body(d: Deadline) -> dict:
     }
 
 
+def _reminder_minutes_of(event: dict) -> int | None:
+    """Extract our popup reminder offset from an existing event, if present."""
+    rem = event.get("reminders") or {}
+    if rem.get("useDefault"):
+        return None
+    for o in rem.get("overrides") or []:
+        if o.get("method") == "popup":
+            return o.get("minutes")
+    return None
+
+
 def needs_update(existing: dict, body: dict) -> bool:
     if existing.get("summary") != body["summary"]:
         return True
+
+    # Start time
     old_start = (existing.get("start") or {}).get("dateTime")
     if not old_start:
+        return True  # e.g. an all-day event; rewrite it as timed
+    if dt.datetime.fromisoformat(old_start) != dt.datetime.fromisoformat(
+        body["start"]["dateTime"]
+    ):
         return True
-    new_start = dt.datetime.fromisoformat(body["start"]["dateTime"])
-    return dt.datetime.fromisoformat(old_start) != new_start
+
+    # End time — catches EVENT_LENGTH_MINUTES changes in .env
+    old_end = (existing.get("end") or {}).get("dateTime")
+    if not old_end:
+        return True
+    if dt.datetime.fromisoformat(old_end) != dt.datetime.fromisoformat(
+        body["end"]["dateTime"]
+    ):
+        return True
+
+    # Reminder offset — catches REMINDER_MINUTES changes in .env
+    want = _reminder_minutes_of(body)
+    if _reminder_minutes_of(existing) != want:
+        return True
+
+    return False
 
 
 def sync(deadlines: list[Deadline], creds: Credentials, dry_run: bool) -> None:
@@ -450,8 +514,17 @@ def sync(deadlines: list[Deadline], creds: Credentials, dry_run: bool) -> None:
     seen: set[str] = set()
 
     for d in sorted(deadlines, key=lambda x: x.due):
+        if d.due < now:
+            log.debug(
+                "Already passed (%s), skipping: %s",
+                d.due.strftime("%Y-%m-%d %H:%M"), d.title[:60],
+            )
+            continue
         if d.due > horizon:
-            log.debug("Beyond horizon, skipping: %s", d.title)
+            log.debug(
+                "Beyond %d-day horizon (%s), skipping: %s",
+                LOOKAHEAD_DAYS, d.due.strftime("%Y-%m-%d %H:%M"), d.title[:60],
+            )
             continue
         seen.add(d.uid)
         body = {k: v for k, v in build_event_body(d).items() if v is not None}
@@ -527,5 +600,37 @@ def main() -> None:
     sync(deadlines, calendar_creds, dry_run=args.dry_run)
 
 
+def _launched_by_double_click() -> bool:
+    """True when run as a .exe with no CLI args — i.e. double-clicked.
+
+    In that case the console window closes the instant main() returns, taking
+    any output or traceback with it, so we pause before exiting.
+    """
+    return getattr(sys, "frozen", False) and len(sys.argv) == 1
+
+
+def _pause(msg: str = "\nPress Enter to close...") -> None:
+    try:
+        input(msg)
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        # sys.exit() from our own error paths — show the message, then hold.
+        if e.code not in (0, None) and _launched_by_double_click():
+            _pause()
+        raise
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        if _launched_by_double_click():
+            _pause("\nSomething went wrong. Press Enter to close...")
+        sys.exit(1)
+    else:
+        if _launched_by_double_click():
+            _pause()

@@ -63,9 +63,9 @@ check("reminder not default", body["reminders"]["useDefault"], False)
 check("event tagged with uid", body["extendedProperties"]["private"]["deadline_sync_id"], "classroom:1")
 check("start == due", body["start"]["dateTime"], d.due.isoformat())
 
-# 4. needs_update: identical event -> False
+# 4. An event missing end/reminders is incomplete -> rewrite it
 existing = {"summary": body["summary"], "start": {"dateTime": body["start"]["dateTime"]}}
-check("unchanged event -> no update", ds.needs_update(existing, body), False)
+check("event missing end+reminders -> update", ds.needs_update(existing, body), True)
 
 # 5. needs_update: due date moved -> True
 moved = dict(existing)
@@ -81,6 +81,50 @@ issues = [{"key": "ENG-42", "fields": {"summary": "Fix login", "duedate": "2026-
 out = ds._jira_issues_to_deadlines(issues)
 check("jira: skips issues with no duedate", len(out), 1)
 check("jira uid", out[0].uid, "jira:ENG-42")
+
+# 8. Long multi-line Classroom titles get collapsed and truncated
+long_title = "نموذج توثيق الدوام 1\n\nعلى النموذج المرفق يجب تدوين الدوام المنجز من التدريب اولا باول " * 3
+d_long = ds.Deadline(uid="classroom:9", title=long_title, due=d.due, source="classroom")
+s = d_long.summary
+check("long title truncated to <=82 chars", len(s) <= 82, True)
+check("no newlines in summary", "\n" in s, False)
+check("truncation marker present", s.endswith("..."), True)
+
+# 9. Short titles are left alone
+d_short = ds.Deadline(uid="jira:X-1", title="Fix login", due=d.due, source="jira")
+check("short title untouched", d_short.summary, "🎫 Fix login")
+
+# 10. Truncated title is preserved in full inside the description
+body_long = ds.build_event_body(d_long)
+check("full title kept in description", "نموذج توثيق الدوام 1" in body_long["description"], True)
+
+# 11. Changing EVENT_LENGTH_MINUTES must trigger an update
+base = ds.build_event_body(d)
+existing_full = {
+    "summary": base["summary"],
+    "start": {"dateTime": base["start"]["dateTime"]},
+    "end": {"dateTime": base["end"]["dateTime"]},
+    "reminders": base["reminders"],
+}
+check("identical incl. end+reminders -> no update", ds.needs_update(existing_full, base), False)
+
+shorter = dict(existing_full)
+shorter["end"] = {"dateTime": "2026-09-13T23:04:00-04:00"}   # 5-min event
+check("changed event length -> update", ds.needs_update(shorter, base), True)
+
+# 12. Changing REMINDER_MINUTES must trigger an update
+old_reminder = dict(existing_full)
+old_reminder["reminders"] = {"useDefault": False, "overrides": [{"method": "popup", "minutes": 30}]}
+check("changed reminder offset -> update", ds.needs_update(old_reminder, base), True)
+
+# 13. Event left on calendar defaults -> update
+defaulted = dict(existing_full)
+defaulted["reminders"] = {"useDefault": True}
+check("useDefault reminders -> update", ds.needs_update(defaulted, base), True)
+
+# 14. Missing end time (all-day) -> update, not a crash
+no_end = {k: v for k, v in existing_full.items() if k != "end"}
+check("missing end -> update", ds.needs_update(no_end, base), True)
 
 print()
 print("ALL PASSED" if not fails else f"{len(fails)} FAILURE(S): {fails}")
