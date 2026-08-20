@@ -62,7 +62,7 @@ def beside_app(path: str) -> str:
 
 # Load .env from the app folder, not the current working directory — double
 # clicking an .exe or running it from Task Scheduler gives an unpredictable cwd.
-load_dotenv(os.path.join(APP_DIR, ".env"))
+load_dotenv(".env")
 
 # Google sometimes returns a *deduplicated* scope set that doesn't literally
 # match what we asked for (overlapping Classroom scopes collapse into each
